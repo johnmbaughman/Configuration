@@ -1,5 +1,7 @@
 @{
-    Configuration = "[1.3.1,2.0)"
-    Pester        = "[4.7.2,5.0)"
-    ModuleBuilder = "[1.0.0,2.0)"
+    Configuration    = "[1.3.1,2.0)"
+    Metadata         = "1.5.*"
+    Pester           = "4.10.*"
+    ModuleBuilder    = "2.0.*"
+    PSScriptAnalyzer = "1.19.1"
 }

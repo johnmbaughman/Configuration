@@ -1,4 +1,9 @@
-.Do.Not.COMMIT.This.Steps.ps1
-output/
-.vs/
+/output/
+/[0-9]*/
+
+/.vs/
 RequiredModules/
+node_modules/
+
+results.xml
+coverage.xml

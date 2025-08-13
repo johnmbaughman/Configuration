@@ -1,14 +1,71 @@
+#requires -Module Configuration
+#using module Configuration
+
 $PSModuleAutoLoadingPreference = "None"
 # Fix IsLinux on Windows PowerShell 5.x
 if (!(Test-Path Variable:Global:IsLinux -ErrorAction SilentlyContinue)){
     $Global:IsLinux = $False
 }
-function global:GetModuleBase {
-    $ModuleBase = (Get-Module "Configuration").ModuleBase
-    if (!$ModuleBase) {
-        $ModuleBase = @(Get-Module "Configuration" -ListAvailable)[0].ModuleBase
+
+# NOTE THIS FAKE IMPLEMENTS THE INTERFACE DuckType style, WITHOUT SAYING SO
+# Unfortunately, this C# class is what's actually used by the tests
+# When it SHOULD be the PowerShell class below
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+public class TestClass : Hashtable {
+    public string Name { get; set; }
+    public string TestMetadata { get; set; }
+
+    public TestClass() {
+        TestMetadata = "@{ Values = @{ User = 'Jaykul' } Name = 'Joel' }";
     }
-    $ModuleBase
+
+    public string ToPsMetadata() {
+        return TestMetadata;
+    }
+
+    public void FromPsMetadata(string Metadata) {
+        Metadata = System.Text.RegularExpressions.Regex.Replace(Metadata.Trim(), @"\s+", " ");
+        if (Metadata != TestMetadata) {
+            throw new ArgumentException("Metadata doesn't match expected value: [" + Metadata + "] [" + TestMetadata + "]");
+        }
+        Name = "Joel";
+        Add("User", "Jaykul");
+    }
+}
+'@
+
+InModuleScope Pester {
+    Import-Module Configuration
+    class TestClass : Hashtable, IPsMetadataSerializable {
+        [string]$Name
+
+        [string] ToPsMetadata() {
+            return ConvertTo-Metadata -InputObject @{
+                Name   = $this.Name
+                Values = @{ } + $this
+            }
+        }
+
+        [void] FromPsMetadata([string]$Metadata) {
+            $self = ConvertFrom-Metadata -InputObject $Metadata
+            $this.PSBase.Name = $self.Name
+            foreach ($key in $self.Values.Keys) {
+                $null = $this.Add($key, $self.Values[$key])
+            }
+        }
+    }
+}
+
+function global:GetModuleBase {
+    $Module = Get-Module "Configuration" -ListAvailable |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    Import-Module "$($Module.ModuleBase)/Configuration.psd1" -Scope Global
+
+    $Module.ModuleBase
 }
 
 
@@ -45,6 +102,8 @@ Given 'the configuration module is imported with testing paths on Linux:' {
         Set-Variable IsLinux $True -Force -Option ReadOnly, AllScope -Scope Global
         Import-Module $ModuleBase/Configuration.psd1 -Scope Global
         Set-Variable IsLinux $False -Force -Option ReadOnly, AllScope -Scope Global
+    } else {
+        Import-Module $ModuleBase/Configuration.psd1 -Scope Global
     }
 
     Update-Metadata -Path $ModuleBase/Configuration.psd1 -PropertyName 'PrivateData.PathOverride.MachineData' -Value ""
@@ -82,6 +141,13 @@ Given 'the configuration module is imported with a URL converter' {
                     [Uri]$Value
                 }
             } -Scope Global
+}
+
+Given 'the configuration module is imported' {
+    param($Table)
+    $ModuleBase = GetModuleBase
+    Remove-Module "Configuration" -ErrorAction Ignore -Force
+    Import-Module $ModuleBase/Configuration.psd1 -Scope Global
 }
 
 Given 'the manifest module is imported' {
@@ -162,10 +228,20 @@ When "the module's (\w+) path should (\w+) (.+)$" {
     [string[]]$Path = $Path -split "\s*and\s*" | %{ $_.Trim("['`"]") }
 
     foreach($PathAssertion in $Path) {
-        $LocalStoragePath = GetStoragePath -Scope $Scope
-        #Write-Host $LocalStoragePath -NoNewline
+        try {
+            # if you're not an administrator, you're going to get Access ... denied
+            $LocalStoragePath = GetStoragePath -Scope $Scope
+        } catch {
+            # this would make most tests fail, because the folder won't exist
+            $LocalStoragePath = GetStoragePath -Scope $Scope -SkipCreatingFolder
+        }
+
+        # This is because of the mock I wrote to test the linux logic on Windows
         if(!$IsLinux -and $PathAssertion -match "\^~?/") {
             $LocalStoragePath = $LocalStoragePath -replace "C:[\\\/]etc","/etc"
+        }
+        # This is just because I want to be able to write ~/ in the paths in tests instead of $Home/
+        if ($PathAssertion -match "\^~?/") {
             $LocalStoragePath = $LocalStoragePath -replace "^$([regex]::escape($Home.TrimEnd("/\")))","~"
         }
         #Write-Host $LocalStoragePath -ForegroundColor Yellow
@@ -245,16 +321,18 @@ When "we say (?<property>.*) is important and update with" {
     $Settings = $Settings | Update-Object -UpdateObject $Update -Important $property
 }
 
-When "a (?:settings file|module manifest) named (\S+)(?:(?: in the (?<Scope>\S+) folder)|(?: for version (?<Version>[0-9.]+)))*" {
+Given "a (?:settings file|module manifest) named (\S+)(?:(?: in the (?<Scope>\S+) folder)|(?: for version (?<Version>[0-9.]+)))*" {
     param($fileName, $hashtable, $Scope = $null, $Version = $null)
 
-    if($Scope -and $Version) {
+    if ($Scope -in "current","parent") {
+        $folder = "TestDrive:/Level1/Level2/"
+    } elseif ($Scope -and $Version) {
         $folder = GetStoragePath -Scope $Scope -Version $Version
-    } elseif($Scope) {
+    } elseif ($Scope) {
         $folder = GetStoragePath -Scope $Scope
-    } elseif($Version) {
+    } elseif ($Version) {
         $folder = GetStoragePath -Version $Version
-    } elseif(Test-Path "$ModulePath") {
+    } elseif ($ModulePath -and (Test-Path "$ModulePath")) {
         $folder = $ModulePath
     } else {
         $folder = "TestDrive:/"
@@ -268,6 +346,14 @@ When "a (?:settings file|module manifest) named (\S+)(?:(?: in the (?<Scope>\S+)
     if(!(Test-Path $Parent -PathType Container)) {
         $null = New-Item $Parent -Type Directory -Force
     }
+    if ($Scope -in "current","parent") {
+        Push-Location "TestDrive:/Level1/Level2/"
+    }
+    if ($Scope -eq "parent") {
+        $Parent = Split-Path $Parent
+        $SettingsFile = Join-Path $Parent $fileName
+    }
+    # Write-Verbose "Creating $SettingsFile" -Verbose
     Set-Content $SettingsFile -Value $hashtable
 }
 
@@ -364,7 +450,7 @@ When "we convert the settings to metadata" {
 
     # # Write-Debug $SettingsMetadata
     $Wide = $Host.UI.RawUI.WindowSize.Width
-    Write-Verbose $SettingsMetadata
+    # Write-Verbose $SettingsMetadata
 }
 
 When "we export to a settings file named (.*)" {
@@ -442,6 +528,17 @@ Given "the settings file does not exist" {
     }
 }
 
+Given "the configuration module exports IPsMetadataSerializable" {
+    "IPsMetadataSerializable" -as [Type] | Should -Not -BeNullOrEmpty
+    [IPsMetadataSerializable].IsInterface | Should -Be $true
+}
+
+Given "a TestClass that implements IPsMetadataSerializable" {
+    # We're duck typing it, so no interface ...
+    # [TestClass].ImplementedInterfaces |
+    #     Where Name -eq IPsMetadataSerializable |
+    #     Should -Not -BeNullOrEmpty
+}
 
 # This step will create verifiable/counting loggable mocks for Write-Warning, Write-Error, Write-Verbose
 Given "we expect an? (?<type>warning|error|verbose) in the (?<module>.*) module" {
@@ -455,7 +552,7 @@ Given "we expect an? (?<type>warning|error|verbose) in the (?<module>.*) module"
         Mock -Module $ErrorModule Write-$type { Write-Host "       Write-Error: $Message" -Foreground Red } -Verifiable
     }
 }
-
+# The error is logged exactly 1 time
 # Then the error is logged exactly 2 times
 # Then the warning is logged 3 times
 # Then the error is logged
@@ -493,22 +590,17 @@ When "we add a converter with a number as a key" {
     }
 }
 
-Then "the settings object should be of type (.*)" {
+Then "the (?:settings|output) object should be of type (.*)" {
     param([Type]$Type)
     $Settings | Should BeOfType $Type
 }
 
-Then "the settings object should have (.*) in the PSTypeNames" {
+Then "the (?:settings|output) object should have (.*) in the PSTypeNames" {
     param([string]$Type)
     $Settings.PSTypeNames -eq $Type | Should Be $Type
 }
 
-Then "the settings object should have an? (.*) of type (.*)" {
-    param([String]$Parameter, [Type]$Type)
-    $Settings.$Parameter | Should BeOfType $Type
-}
-
-Then "the settings object's (.*) should (be of type|be) (.*)" {
+Then "the (?:settings|output) object's (.*) should (be of type|be) (.*)" {
     param([String]$Parameter, [String]$operator, $Expected)
     $Value = $Settings
     Set-StrictMode -Off
@@ -673,4 +765,109 @@ Then "a settings file named (\S+) should exist(?:(?: in the (?<Scope>\S+) folder
     }
     $SettingsFile = Join-Path $folder $fileName
     $SettingsFile | Should Exist
+}
+
+Given "a passthru command '(?<Command>[A-Z][a-z]+-[A-Z][a-z]+)' with (?<Parameters>.*) parameters" {
+    param($Command, $Parameters)
+
+    [string[]]$Parameters = $Parameters -split "\s*and\s*" | % { $_.Trim("['`"]") }
+
+    $Function = "
+    function $Command {
+        param(`$$($Parameters -join ", `$"))
+        `$global:DebugPreference = 'Continue'
+        Import-ParameterConfiguration
+        @{  $(foreach ($name in $Parameters) {
+                "`n            $Name = `$$Name"
+            })
+        }
+        `$global:DebugPreference = 'SilentlyContinue'
+    }
+    "
+    Invoke-Expression $Function
+}
+
+Given "a passthru command '(?<Command>[A-Z][a-z]+-[A-Z][a-z]+)' with (?<Parameters>.*) parameters that calls Get-ParameterValue(?<FromFile> with a file config)?" {
+    param($Command, $Parameters, $FromFile)
+
+    [string[]]$Parameters = $Parameters -split "\s*and\s*"
+
+    $Function = "
+    function $Command {
+        param(
+            `$$($Parameters -join ", `$"),
+            [Alias('Alias')]
+            `$ExtraParameter
+        )
+        `$global:DebugPreference = 'Continue'
+        Get-ParameterValue $(if($FromFile){ "-FromFile Verb.psd1" })
+        `$global:DebugPreference = 'SilentlyContinue'
+    }
+    "
+    Invoke-Expression $Function
+}
+
+Given "an example New-User command" {
+    function New-User {
+        [CmdletBinding()]
+        param(
+            $FirstName,
+            $LastName,
+            $UserName,
+            $Domain,
+            $EMail,
+            $Department,
+            [hashtable]$Permissions
+        )
+        Import-ParameterConfiguration -Recurse -FileName "${Department}User.psd1"
+        # Possibly calculated based on (default) parameter values
+        if (-not $UserName) { $UserName = "$FirstName.$LastName" }
+        if (-not $EMail)    { $EMail = "$UserName@$Domain" }
+
+        # Lots of work to create the user's AD account, email, set permissions etc.
+
+        # Output an object:
+        [PSCustomObject]@{
+            PSTypeName  = "MagicUser"
+            FirstName   = $FirstName
+            LastName    = $LastName
+            EMail       = $EMail
+            Department  = $Department
+            Permissions = $Permissions
+        }
+    }
+}
+
+
+When "I call (Test-Verb|New-User)(?<Parameters> .*)?" {
+    param($Command, $Parameters)
+    try {
+        # Write-Verbose "$Command $Parameters" -Verbose
+        # $global:DebugPreference = 'Continue'
+
+        $Settings = Invoke-Command ([ScriptBlock]::Create("$Command $Parameters"))
+
+        # $global:DebugPreference = 'SilentlyContinue'
+        # Write-Verbose (($Settings | Out-String -Stream | % TrimEnd) -join "`n") -Verbose
+    } finally {
+        Pop-Location
+    }
+}
+
+Given "we define (?<Name>[\:\w]+) = (?<Value>.*)" {
+    param($Name, $Value)
+    if ($Name -match "^env:") {
+        Set-Content $Name $Value
+    } else {
+        # we shouldn't have to set it global, but because of pester ...
+        Set-Variable $Name $Value -Scope Global
+    }
+}
+
+When "we import the file allowing variables (?<Variables>.*)" {
+    param($Variables)
+    $Variables = $Variables.Trim() -split "\s*,\s*"
+    $Settings = Import-Metadata ${SettingsFile} -AllowedVariables $Variables
+
+    Write-Verbose (($Settings | Out-String -Stream | ForEach-Object TrimEnd) -join "`n")
 }
